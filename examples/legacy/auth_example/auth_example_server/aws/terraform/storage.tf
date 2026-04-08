@@ -22,6 +22,19 @@ resource "aws_s3_bucket_acl" "public_storage" {
   acl    = "private"
 }
 
+# Opt out of the AWS-default Block Public Access so that the presigned POST
+# upload (which carries acl=public-read) is accepted, and so that CloudFront
+# can serve the objects anonymously via its S3 origin. Only the public bucket
+# needs this — private_storage keeps the default (all blocks on).
+resource "aws_s3_bucket_public_access_block" "public_storage" {
+  bucket = aws_s3_bucket.public_storage.id
+
+  block_public_acls       = false
+  block_public_policy     = false
+  ignore_public_acls      = false
+  restrict_public_buckets = false
+}
+
 resource "aws_s3_bucket" "private_storage" {
   bucket        = var.private_storage_bucket_name
   force_destroy = true
