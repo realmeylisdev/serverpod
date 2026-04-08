@@ -38,10 +38,21 @@ abstract class PasswordRequirement {
   static final numbers = RegExp(r'[0-9]');
 
   /// Regular expression for special characters.
-  static final specialCharacters = RegExp(r'[!@#$%^&*(),.?":{}|<>]');
+  ///
+  /// Matches the OWASP-recommended printable ASCII special character set.
+  /// See
+  /// https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html
+  static final specialCharacters = RegExp(
+    r'''[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~]''',
+  );
 
   /// Regular expression for all allowed characters.
-  static final allowedCharacters = RegExp(r'[a-zA-Z0-9!@#$%^&*(),.?":{}|<>]');
+  ///
+  /// Matches letters, digits, and the OWASP-recommended printable ASCII
+  /// special character set.
+  static final allowedCharacters = RegExp(
+    r'''[a-zA-Z0-9!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~]''',
+  );
 
   /// Creates a custom requirement with a free-form [description] and
   /// [validator].
