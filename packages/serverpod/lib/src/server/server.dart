@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io' as io;
 import 'dart:typed_data';
 
+import 'package:meta/meta.dart';
 import 'package:serverpod/serverpod.dart';
 import 'package:serverpod/src/cache/caches.dart';
 import 'package:serverpod/src/server/diagnostic_events/diagnostic_events.dart';
@@ -174,11 +175,16 @@ class Server implements RouterInjectable {
     _authenticationHandler = authenticationHandler;
 
     try {
-      final server = await _app.serve(
-        address: io.InternetAddress.anyIPv6,
+      final httpServer = await bindHttpServer(
+        io.InternetAddress.anyIPv6,
         port: _port,
-        securityContext: _securityContext,
+        context: _securityContext,
       );
+      final adapter = _LifecycleTrackingAdapter(
+        httpServer,
+        onTerminate: _onTransportTerminated,
+      );
+      final server = await _app.run(() => adapter);
       _actualPort = server.port;
       _relicServer = server;
     } catch (e, stackTrace) {
@@ -199,6 +205,29 @@ class Server implements RouterInjectable {
       'Server started on $scheme://localhost:$port',
     );
     return _running;
+  }
+
+  /// Called when the underlying HTTP transport terminates outside of a
+  /// graceful [shutdown] — e.g. when the `HttpServer` request stream emits
+  /// an error (`SocketException: Connection reset by peer`) or completes
+  /// unexpectedly. Flips [_running] to `false` so that health checks and
+  /// consumers of [running] observe the actual transport state instead of
+  /// the stale "start succeeded" latch.
+  ///
+  /// During [shutdown] this is a no-op because [_running] is cleared first,
+  /// preventing duplicate reports when we ourselves close the transport.
+  void _onTransportTerminated(Object? error, StackTrace? stackTrace) {
+    if (!_running) return;
+    _running = false;
+    unawaited(
+      _reportFrameworkException(
+        error ?? StateError('HTTP server request stream closed unexpectedly'),
+        stackTrace ?? StackTrace.current,
+        message:
+            'HTTP transport terminated outside of Server.shutdown(); '
+            'marking server as not running.',
+      ),
+    );
   }
 
   Handler _verboseLogging(Handler next) {
@@ -558,6 +587,11 @@ class Server implements RouterInjectable {
   /// Shuts the server down.
   /// Returns a [Future] that completes when the server is shut down.
   Future<void> shutdown() async {
+    // Flip the running flag *before* closing the transport, so that the
+    // lifecycle-tracking adapter's `handleDone` (which fires when
+    // `_app.close()` drains the request stream) does not misreport the
+    // graceful shutdown as an unexpected crash.
+    _running = false;
     await _app.close();
     var webSockets = _webSockets.values.toList();
     List<Future<void>> webSocketCompletions = [];
@@ -568,7 +602,6 @@ class Server implements RouterInjectable {
 
     // Wait for all WebSockets to close.
     await Future.wait(webSocketCompletions);
-    _running = false;
   }
 
   Future<void> _reportFrameworkException(
@@ -611,5 +644,70 @@ extension ServerInternalMethods on Server {
     AuthenticationHandler authenticationHandler,
   ) {
     _authenticationHandler = authenticationHandler;
+  }
+}
+
+/// Creates a pass-through [StreamTransformer] that invokes [onTerminate]
+/// the first time the underlying stream emits an error or completes.
+///
+/// Subsequent error/done events are forwarded normally but do not trigger
+/// additional `onTerminate` calls, so that a stream which errors and then
+/// closes (the common `HttpServer` failure pattern) only reports once.
+///
+/// Used by [Server.start] to observe the lifecycle of the `HttpServer`
+/// request stream that Relic listens to. Relic's internal listener attaches
+/// no `onError` / `onDone` handlers, so without this transformer an abrupt
+/// transport failure (e.g. `SocketException: Connection reset by peer`)
+/// leaves [Server.running] stuck at `true`. See serverpod/serverpod#3696.
+///
+/// Exposed as `@visibleForTesting` so the tap-and-forward behavior can be
+/// verified in isolation without needing a real bound HTTP server.
+@visibleForTesting
+StreamTransformer<T, T> createTransportLifecycleTransformer<T>({
+  required void Function(Object? error, StackTrace? stackTrace) onTerminate,
+}) {
+  var terminated = false;
+  void notifyOnce(Object? error, StackTrace? stackTrace) {
+    if (terminated) return;
+    terminated = true;
+    onTerminate(error, stackTrace);
+  }
+
+  return StreamTransformer<T, T>.fromHandlers(
+    handleData: (data, sink) => sink.add(data),
+    handleError: (error, stackTrace, sink) {
+      notifyOnce(error, stackTrace);
+      sink.addError(error, stackTrace);
+    },
+    handleDone: (sink) {
+      notifyOnce(null, null);
+      sink.close();
+    },
+  );
+}
+
+/// Wraps an [IOAdapter] and taps into the request stream so that stream
+/// termination (error or done) outside of a graceful shutdown is surfaced
+/// to the caller via `onTerminate`.
+class _LifecycleTrackingAdapter extends IOAdapter {
+  _LifecycleTrackingAdapter(
+    super.server, {
+    required void Function(Object? error, StackTrace? stackTrace) onTerminate,
+  }) : _onTerminate = onTerminate;
+
+  final void Function(Object? error, StackTrace? stackTrace) _onTerminate;
+
+  // [IOAdapter.requests] produces a fresh `HttpServer.map(...)` stream on
+  // each read. Memoize the transformed stream so that we never risk a second
+  // (illegal) subscription on the single-subscription `HttpServer` stream.
+  Stream<AdapterRequest>? _cached;
+
+  @override
+  Stream<AdapterRequest> get requests {
+    return _cached ??= super.requests.transform(
+      createTransportLifecycleTransformer<AdapterRequest>(
+        onTerminate: _onTerminate,
+      ),
+    );
   }
 }
